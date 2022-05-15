@@ -1,10 +1,13 @@
 package stream
 
 import (
+	"github.com/cornelk/hashmap"
 	"github.com/kabu1204/go-pipeline/optional"
 	"github.com/kabu1204/go-pipeline/types"
+	"github.com/panjf2000/ants/v2"
 	"reflect"
 	"sort"
+	"sync"
 )
 
 // source <- Filtered <- ToSlice
@@ -13,20 +16,21 @@ type Option func(*stream)
 type wrappedConsumer func(next *stream) []Option
 
 type stream struct {
-	source   types.Iterator
-	prev     *stream
-	wrapper  wrappedConsumer
-	consumer types.Consumer
-	settler  func(int64)
-	cleaner  func()
-	Name     string
+	source    types.Iterator
+	prev      *stream
+	wrapper   wrappedConsumer
+	consumer  types.Consumer
+	settler   func(int64)
+	cleaner   func()
+	canceller func() bool
+	Name      string
 }
 
 func (s *stream) terminate() {
 	head := s.setFunctor()
 	it := s.source
-	head.settler(10)
-	for v, ok := it.Next(); ok; v, ok = it.Next() {
+	head.settler(int64(it.Len()))
+	for v, ok := it.Next(); ok && !head.canceller(); v, ok = it.Next() {
 		head.consumeOne(*v)
 	}
 	head.cleaner()
@@ -46,15 +50,17 @@ func (s *stream) unwrap(next *stream) {
 func wrapConsumer(c types.Consumer) Option { return func(s *stream) { s.consumer = c } }
 func wrapSettler(c func(int64)) Option     { return func(s *stream) { s.settler = c } }
 func wrapCleaner(c func()) Option          { return func(s *stream) { s.cleaner = c } }
+func wrapCanceller(c func() bool) Option   { return func(s *stream) { s.canceller = c } }
 
 func (s *stream) setFunctor() *stream {
 	s.unwrap(&stream{
-		source:   s.source,
-		prev:     s,
-		consumer: func(e interface{}) {},
-		settler:  func(i int64) {},
-		cleaner:  func() {},
-		Name:     "DummyTail",
+		source:    s.source,
+		prev:      s,
+		consumer:  func(e interface{}) {},
+		settler:   func(i int64) {},
+		cleaner:   func() {},
+		canceller: func() bool { return false },
+		Name:      "DummyTail",
 	})
 	p := s
 	for ; p.prev != nil; p = p.prev {
@@ -131,33 +137,60 @@ func (s *stream) Peek(f types.Consumer) Stream {
 	wrapper := func(next *stream) []Option {
 		consumer := func(e interface{}) {
 			f(e)
+			next.consumeOne(e)
 		}
 		return append(defaultWrapper(next), wrapConsumer(consumer))
 	}
 	return newStream(s, wrapper, "Peek")
 }
 
+func (s *stream) Parallel(n int) Stream {
+	wrapper := func(next *stream) []Option {
+		var wg sync.WaitGroup
+		var pool *ants.Pool
+		settler := func(sz int64) {
+			pool, _ = ants.NewPool(n)
+			next.settler(sz)
+		}
+		consumer := func(e interface{}) {
+			wg.Add(1)
+			f := func() {
+				next.consumeOne(e)
+				wg.Done()
+			}
+			_ = pool.Submit(f)
+		}
+		cleaner := func() {
+			wg.Wait()
+			pool.Release()
+			pool = nil
+		}
+		return append(defaultWrapper(next), wrapSettler(settler), wrapConsumer(consumer), wrapCleaner(cleaner))
+	}
+	return newStream(s, wrapper, "Parallel")
+}
+
 // stateful
 
 func (s *stream) Distinct(f types.IntFunction) Stream {
 	wrapper := func(next *stream) []Option {
-		var set map[int]struct{}
+		var set *hashmap.HashMap
 		settler := func(sz int64) {
-			set = make(map[int]struct{})
+			set = &hashmap.HashMap{}
+			set.Grow(uintptr(sz))
 			next.settler(sz)
 		}
 		consumer := func(e interface{}) {
 			hash := f(e)
-			if _, exist := set[hash]; !exist {
-				set[hash] = struct{}{}
+			if _, exist := set.GetOrInsert(hash, struct{}{}); !exist {
 				next.consumeOne(e)
 			}
 		}
 		cleaner := func() {
-			set = nil
+
 			next.cleaner()
 		}
-		return []Option{wrapSettler(settler), wrapConsumer(consumer), wrapCleaner(cleaner)}
+		return append(defaultWrapper(next), wrapSettler(settler), wrapConsumer(consumer), wrapCleaner(cleaner))
 	}
 	return newStream(s, wrapper, "Distinct")
 }
@@ -176,13 +209,13 @@ func (s *stream) Sorted(cmp types.Comparator) Stream {
 			sort.Sort(&types.Array{Data: slice, Cmp: cmp})
 			next.settler(int64(len(slice)))
 			it := slice.Iterator()
-			for v, ok := it.Next(); ok; v, ok = it.Next() {
+			for v, ok := it.Next(); ok && !next.canceller(); v, ok = it.Next() {
 				next.consumeOne(*v)
 			}
 			slice = nil
 			next.cleaner()
 		}
-		return []Option{wrapSettler(settler), wrapConsumer(consumer), wrapCleaner(cleaner)}
+		return append(defaultWrapper(next), wrapSettler(settler), wrapConsumer(consumer), wrapCleaner(cleaner))
 	}
 	return newStream(s, wrapper, "Sorted")
 }
@@ -196,16 +229,18 @@ func (s *stream) Limit(N int64) Stream {
 		}
 		consumer := func(e interface{}) {
 			if cnt < N {
-				next.consumeOne(e)
 				cnt++
+				next.consumeOne(e)
 			}
-			// TODO: early stop
 		}
 		cleaner := func() {
 			cnt = 0
 			next.cleaner()
 		}
-		return []Option{wrapSettler(settler), wrapConsumer(consumer), wrapCleaner(cleaner)}
+		canceller := func() bool {
+			return cnt == N
+		}
+		return []Option{wrapSettler(settler), wrapConsumer(consumer), wrapCleaner(cleaner), wrapCanceller(canceller)}
 	}
 	return newStream(s, wrapper, "Limit")
 }
@@ -228,7 +263,7 @@ func (s *stream) Skip(N int64) Stream {
 			cnt = 0
 			next.cleaner()
 		}
-		return []Option{wrapSettler(settler), wrapConsumer(consumer), wrapCleaner(cleaner)}
+		return append(defaultWrapper(next), wrapSettler(settler), wrapConsumer(consumer), wrapCleaner(cleaner))
 	}
 	return newStream(s, wrapper, "Skip")
 }
@@ -284,10 +319,12 @@ func (s *stream) AllMatch(p types.Predicate) bool {
 		consumer := func(e interface{}) {
 			if !p(e) {
 				flag = false
-				// TODO: early stop
 			}
 		}
-		return append(defaultWrapper(next), wrapSettler(settler), wrapConsumer(consumer))
+		canceller := func() bool {
+			return !flag
+		}
+		return append(defaultWrapper(next), wrapSettler(settler), wrapConsumer(consumer), wrapCanceller(canceller))
 	}
 	newStream(s, wrapper, "AllMatch").terminate()
 	return flag
@@ -303,10 +340,12 @@ func (s *stream) NoneMatch(p types.Predicate) bool {
 		consumer := func(e interface{}) {
 			if !p(e) {
 				flag = true
-				// TODO: early stop
 			}
 		}
-		return append(defaultWrapper(next), wrapSettler(settler), wrapConsumer(consumer))
+		canceller := func() bool {
+			return flag
+		}
+		return append(defaultWrapper(next), wrapSettler(settler), wrapConsumer(consumer), wrapCanceller(canceller))
 	}
 	newStream(s, wrapper, "NoneMatch").terminate()
 	return flag
@@ -322,10 +361,12 @@ func (s *stream) AnyMatch(p types.Predicate) bool {
 		consumer := func(e interface{}) {
 			if p(e) {
 				flag = true
-				// TODO: early stop
 			}
 		}
-		return append(defaultWrapper(next), wrapSettler(settler), wrapConsumer(consumer))
+		canceller := func() bool {
+			return flag
+		}
+		return append(defaultWrapper(next), wrapSettler(settler), wrapConsumer(consumer), wrapCanceller(canceller))
 	}
 	newStream(s, wrapper, "AnyMatch").terminate()
 	return flag
@@ -385,9 +426,11 @@ func (s *stream) FindFirst(p types.Predicate) optional.Optional {
 				result = e
 				none = false
 			}
-			// TODO: early stop
 		}
-		return append(defaultWrapper(next), wrapConsumer(consumer))
+		canceller := func() bool {
+			return !none
+		}
+		return append(defaultWrapper(next), wrapConsumer(consumer), wrapCanceller(canceller))
 	}
 	newStream(s, wrapper, "FindFirst").terminate()
 	if none {

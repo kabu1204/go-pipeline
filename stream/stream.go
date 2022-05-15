@@ -14,6 +14,8 @@ type Stream interface {
 	FlatMap(f func(interface{}) Stream) Stream
 	Peek(f types.Consumer) Stream
 
+	Parallel(n int) Stream
+
 	// stateless (nothing to do with elements order)
 	Distinct(f types.IntFunction) Stream // custom hash, therefore the elements order may affect result
 	Sorted(cmp types.Comparator) Stream  // stable, therefore the elements order may affect sort result

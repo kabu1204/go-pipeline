@@ -10,5 +10,9 @@ func defaultWrapper(next *stream) []Option {
 	defaultCleaner := func() {
 		next.cleaner()
 	}
-	return []Option{wrapConsumer(defaultConsumer), wrapSettler(defaultSettler), wrapCleaner(defaultCleaner)}
+	defaultCanceller := func() bool {
+		return next.canceller()
+	}
+	return []Option{wrapConsumer(defaultConsumer), wrapSettler(defaultSettler),
+		wrapCleaner(defaultCleaner), wrapCanceller(defaultCanceller)}
 }

@@ -3,6 +3,7 @@ package types
 type Iterator interface {
 	hasNext() bool
 	Next() (*interface{}, bool)
+	Len() int // for slice and map: a definite number; for channel: -1
 }
 
 type sliceIterator struct {
@@ -27,6 +28,10 @@ func (it *sliceIterator) Next() (*interface{}, bool) {
 		return &((*it.slice)[it.index]), true
 	}
 	return nil, false
+}
+
+func (it *sliceIterator) Len() int {
+	return len(*it.slice)
 }
 
 func (it *sliceIterator) At(i int) *interface{} {

@@ -93,9 +93,11 @@ func exampleReduce() {
 	cmp := func(a, b interface{}) int {
 		return a.(int) - b.(int)
 	}
-	result := m.Sorted(cmp).Distinct(func(i interface{}) int {
+	result := m.Sorted(cmp).Parallel(20).Distinct(func(i interface{}) int {
 		return i.(int) % 100000
-	}).Limit(3).Reduce(func(acc, t interface{}) interface{} {
+	}).Peek(func(e interface{}) {
+		fmt.Println("Peek:", e)
+	}).Limit(30).Reduce(func(acc, t interface{}) interface{} {
 		return acc.(int) + t.(int)
 	})
 	if !result.IsNone() {
