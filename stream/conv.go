@@ -1,7 +1,7 @@
 package stream
 
 import (
-	"code.byted.org/yuchengye/pipeline/types"
+	"github.com/kabu1204/go-pipeline/types"
 	"reflect"
 )
 

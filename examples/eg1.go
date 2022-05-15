@@ -1,9 +1,9 @@
 package main
 
 import (
-	"code.byted.org/yuchengye/pipeline/stream"
-	"code.byted.org/yuchengye/pipeline/types"
 	"fmt"
+	"github.com/kabu1204/go-pipeline/stream"
+	"github.com/kabu1204/go-pipeline/types"
 )
 
 type Info struct {

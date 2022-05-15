@@ -1,3 +1,3 @@
-module github.com/kabu1204/pipeline
+module github.com/kabu1204/go-pipeline
 
 go 1.16

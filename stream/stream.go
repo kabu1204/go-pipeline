@@ -1,8 +1,8 @@
 package stream
 
 import (
-	"code.byted.org/yuchengye/pipeline/optional"
-	"code.byted.org/yuchengye/pipeline/types"
+	"github.com/kabu1204/go-pipeline/optional"
+	"github.com/kabu1204/go-pipeline/types"
 	"reflect"
 )
 

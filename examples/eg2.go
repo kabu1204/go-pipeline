@@ -1,8 +1,8 @@
 package main
 
 import (
-	"code.byted.org/yuchengye/pipeline/stream"
 	"fmt"
+	"github.com/kabu1204/go-pipeline/stream"
 )
 
 func exampleLazyFilter() {
