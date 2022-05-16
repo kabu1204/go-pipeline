@@ -83,9 +83,7 @@ func exampleSort() {
 	cmp := func(a, b interface{}) int {
 		return a.(int) - b.(int)
 	}
-	fmt.Println(m.Limit(10).Skip(3).Sorted(cmp).Distinct(func(i interface{}) int {
-		return i.(int) % 100000
-	}).ToSlice())
+	fmt.Println(m.Sorted(cmp).Limit(10).Skip(3).ToSlice())
 }
 
 func exampleReduce() {
@@ -109,5 +107,5 @@ func main() {
 	exampleMapField()
 	exampleFlatMap()
 	exampleSort()
-	exampleReduce()
+	//exampleReduce()
 }

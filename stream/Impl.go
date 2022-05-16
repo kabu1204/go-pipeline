@@ -1,12 +1,14 @@
 package stream
 
 import (
+	"fmt"
 	"github.com/cornelk/hashmap"
+	"github.com/emirpasic/gods/maps/treemap"
+	"github.com/emirpasic/gods/utils"
 	"github.com/kabu1204/go-pipeline/optional"
 	"github.com/kabu1204/go-pipeline/types"
 	"github.com/panjf2000/ants/v2"
 	"reflect"
-	"sort"
 	"sync"
 )
 
@@ -23,6 +25,7 @@ type stream struct {
 	settler   func(int64)
 	cleaner   func()
 	canceller func() bool
+	parallel  bool
 	Name      string
 }
 
@@ -197,22 +200,30 @@ func (s *stream) Distinct(f types.IntFunction) Stream {
 
 func (s *stream) Sorted(cmp types.Comparator) Stream {
 	wrapper := func(next *stream) []Option {
-		var slice types.Slice
+		var mp *treemap.Map
 		settler := func(capacity int64) {
-			slice = make(types.Slice, 0, capacity)
+			mp = treemap.NewWith(utils.Comparator(cmp))
 			next.settler(capacity)
 		}
 		consumer := func(e interface{}) {
-			slice = append(slice, e)
+			if c, ok := mp.Get(e); ok {
+				mp.Put(e, c.(int)+1)
+			} else {
+				mp.Put(e, 1)
+			}
+			fmt.Println(mp.String())
 		}
 		cleaner := func() {
-			sort.Sort(&types.Array{Data: slice, Cmp: cmp})
-			next.settler(int64(len(slice)))
-			it := slice.Iterator()
-			for v, ok := it.Next(); ok && !next.canceller(); v, ok = it.Next() {
-				next.consumeOne(*v)
+			next.settler(int64(mp.Size()))
+			it := mp.Iterator()
+			for it.Next() {
+				e, c := it.Key(), it.Value().(int)
+				for ; c > 0; c-- {
+					next.consumeOne(e) // 值传递？
+				}
 			}
-			slice = nil
+			mp.Clear()
+			mp = nil
 			next.cleaner()
 		}
 		return append(defaultWrapper(next), wrapSettler(settler), wrapConsumer(consumer), wrapCleaner(cleaner))
