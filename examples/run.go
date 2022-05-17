@@ -1,7 +1,3 @@
 package main
 
-func main() {
-	exampleLazyFilter()
-	exampleMapField()
-	exampleFlatMap()
-}
+func main() {}

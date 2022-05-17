@@ -83,7 +83,7 @@ func exampleSort() {
 	cmp := func(a, b interface{}) int {
 		return a.(int) - b.(int)
 	}
-	fmt.Println(m.Sorted(cmp).Limit(10).Skip(3).ToSlice())
+	fmt.Println(m.Sorted(cmp, false).Limit(10).Skip(3).ToSlice())
 }
 
 func exampleReduce() {
@@ -91,11 +91,11 @@ func exampleReduce() {
 	cmp := func(a, b interface{}) int {
 		return a.(int) - b.(int)
 	}
-	result := m.Sorted(cmp).Parallel(20).Distinct(func(i interface{}) int {
+	result := m.Parallel(20).Distinct(func(i interface{}) int {
 		return i.(int) % 100000
-	}).Peek(func(e interface{}) {
+	}).Sorted(cmp, true).Limit(10).Peek(func(e interface{}) {
 		fmt.Println("Peek:", e)
-	}).Limit(30).Reduce(func(acc, t interface{}) interface{} {
+	}).Reduce(func(acc, t interface{}) interface{} {
 		return acc.(int) + t.(int)
 	})
 	if !result.IsNone() {
@@ -104,8 +104,8 @@ func exampleReduce() {
 }
 
 func main() {
-	exampleMapField()
-	exampleFlatMap()
-	exampleSort()
-	//exampleReduce()
+	//exampleMapField()
+	//exampleFlatMap()
+	//exampleSort()
+	exampleReduce()
 }

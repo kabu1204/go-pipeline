@@ -4,8 +4,11 @@ func defaultWrapper(next *stream) []Option {
 	defaultConsumer := func(e interface{}) {
 		next.consumeOne(e)
 	}
-	defaultSettler := func(capacity int64) {
-		next.settler(capacity)
+	defaultSettler := func(capacity int64, opts ...Option) {
+		for _, o := range opts {
+			o(next.prev) // o(this)
+		}
+		next.settler(capacity, opts...)
 	}
 	defaultCleaner := func() {
 		next.cleaner()

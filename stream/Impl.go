@@ -1,7 +1,6 @@
 package stream
 
 import (
-	"fmt"
 	"github.com/cornelk/hashmap"
 	"github.com/emirpasic/gods/maps/treemap"
 	"github.com/emirpasic/gods/utils"
@@ -10,22 +9,24 @@ import (
 	"github.com/panjf2000/ants/v2"
 	"reflect"
 	"sync"
+	"sync/atomic"
 )
 
 // source <- Filtered <- ToSlice
 
+//type settlerOption func(this *stream)
 type Option func(*stream)
-type wrappedConsumer func(next *stream) []Option
+type wrapperType func(next *stream) []Option
 
 type stream struct {
 	source    types.Iterator
 	prev      *stream
-	wrapper   wrappedConsumer
+	wrapper   wrapperType
 	consumer  types.Consumer
-	settler   func(int64)
+	settler   func(size int64, opts ...Option)
 	cleaner   func()
 	canceller func() bool
-	parallel  bool
+	parallel  int
 	Name      string
 }
 
@@ -50,19 +51,20 @@ func (s *stream) unwrap(next *stream) {
 	}
 }
 
-func wrapConsumer(c types.Consumer) Option { return func(s *stream) { s.consumer = c } }
-func wrapSettler(c func(int64)) Option     { return func(s *stream) { s.settler = c } }
-func wrapCleaner(c func()) Option          { return func(s *stream) { s.cleaner = c } }
-func wrapCanceller(c func() bool) Option   { return func(s *stream) { s.canceller = c } }
+func wrapConsumer(c types.Consumer) Option        { return func(s *stream) { s.consumer = c } }
+func wrapSettler(c func(int64, ...Option)) Option { return func(s *stream) { s.settler = c } }
+func wrapCleaner(c func()) Option                 { return func(s *stream) { s.cleaner = c } }
+func wrapCanceller(c func() bool) Option          { return func(s *stream) { s.canceller = c } }
 
 func (s *stream) setFunctor() *stream {
 	s.unwrap(&stream{
 		source:    s.source,
 		prev:      s,
-		consumer:  func(e interface{}) {},
-		settler:   func(i int64) {},
+		consumer:  func(_ interface{}) {},
+		settler:   func(_ int64, _ ...Option) {},
 		cleaner:   func() {},
 		canceller: func() bool { return false },
+		parallel:  0,
 		Name:      "DummyTail",
 	})
 	p := s
@@ -72,12 +74,13 @@ func (s *stream) setFunctor() *stream {
 	return p
 }
 
-func newStream(prev *stream, wrapper wrappedConsumer, name string) *stream {
+func newStream(prev *stream, wrapper wrapperType, name string) *stream {
 	return &stream{
-		source:  prev.source,
-		prev:    prev,
-		wrapper: wrapper,
-		Name:    name,
+		source:   prev.source,
+		prev:     prev,
+		wrapper:  wrapper,
+		parallel: 0,
+		Name:     name,
 	}
 }
 
@@ -151,9 +154,16 @@ func (s *stream) Parallel(n int) Stream {
 	wrapper := func(next *stream) []Option {
 		var wg sync.WaitGroup
 		var pool *ants.Pool
-		settler := func(sz int64) {
-			pool, _ = ants.NewPool(n)
-			next.settler(sz)
+		settler := func(sz int64, opts ...Option) {
+			if n >= 0 {
+				toggleParallel := func(this *stream) { this.parallel = n }
+				opts = append(opts, toggleParallel)
+			}
+			for _, o := range opts {
+				o(next.prev)
+			}
+			pool, _ = ants.NewPool(MaxInt(n, 1))
+			next.settler(sz, opts...)
 		}
 		consumer := func(e interface{}) {
 			wg.Add(1)
@@ -167,6 +177,7 @@ func (s *stream) Parallel(n int) Stream {
 			wg.Wait()
 			pool.Release()
 			pool = nil
+			next.cleaner()
 		}
 		return append(defaultWrapper(next), wrapSettler(settler), wrapConsumer(consumer), wrapCleaner(cleaner))
 	}
@@ -178,10 +189,12 @@ func (s *stream) Parallel(n int) Stream {
 func (s *stream) Distinct(f types.IntFunction) Stream {
 	wrapper := func(next *stream) []Option {
 		var set *hashmap.HashMap
-		settler := func(sz int64) {
+		settler := func(sz int64, opts ...Option) {
+			for _, o := range opts {
+				o(next.prev)
+			}
 			set = &hashmap.HashMap{}
-			set.Grow(uintptr(sz))
-			next.settler(sz)
+			next.settler(sz, opts...)
 		}
 		consumer := func(e interface{}) {
 			hash := f(e)
@@ -198,23 +211,51 @@ func (s *stream) Distinct(f types.IntFunction) Stream {
 	return newStream(s, wrapper, "Distinct")
 }
 
-func (s *stream) Sorted(cmp types.Comparator) Stream {
+func (s *stream) Sorted(cmp types.Comparator, keepParallel bool) Stream {
 	wrapper := func(next *stream) []Option {
+		var buffer chan interface{}
 		var mp *treemap.Map
-		settler := func(capacity int64) {
+		this := next.prev
+		settler := func(capacity int64, opts ...Option) {
+			for _, o := range opts {
+				o(this)
+			}
 			mp = treemap.NewWith(utils.Comparator(cmp))
-			next.settler(capacity)
+			if this.parallel > 0 {
+				buffer = make(chan interface{}, capacity)
+				writer := func() {
+					for e := range buffer {
+						if c, ok := mp.Get(e); ok {
+							mp.Put(e, c.(int)+1)
+						} else {
+							mp.Put(e, 1)
+						}
+					}
+				}
+				go writer()
+			}
+			next.settler(capacity, opts...)
 		}
 		consumer := func(e interface{}) {
-			if c, ok := mp.Get(e); ok {
-				mp.Put(e, c.(int)+1)
+			if this.parallel > 0 {
+				buffer <- e
 			} else {
-				mp.Put(e, 1)
+				if c, ok := mp.Get(e); ok {
+					mp.Put(e, c.(int)+1)
+				} else {
+					mp.Put(e, 1)
+				}
 			}
-			fmt.Println(mp.String())
 		}
 		cleaner := func() {
-			next.settler(int64(mp.Size()))
+			opts := make([]Option, 0)
+			if !keepParallel || this.parallel == 0 {
+				opts = append(opts, func(_this *stream) { _this.parallel = 0 })
+			}
+			if this.parallel > 0 {
+				close(buffer)
+			}
+			next.settler(int64(mp.Size()), opts...)
 			it := mp.Iterator()
 			for it.Next() {
 				e, c := it.Key(), it.Value().(int)
@@ -228,50 +269,65 @@ func (s *stream) Sorted(cmp types.Comparator) Stream {
 		}
 		return append(defaultWrapper(next), wrapSettler(settler), wrapConsumer(consumer), wrapCleaner(cleaner))
 	}
+	if keepParallel {
+		return newStream(s, wrapper, "Sorted").Parallel(-1)
+	}
 	return newStream(s, wrapper, "Sorted")
 }
 
 func (s *stream) Limit(N int64) Stream {
 	wrapper := func(next *stream) []Option {
-		var cnt int64
-		settler := func(sz int64) {
-			cnt = 0
-			next.settler(sz)
+		var cnt *int64
+		settler := func(sz int64, opts ...Option) {
+			for _, o := range opts {
+				o(next.prev)
+			}
+			cnt = new(int64)
+			next.settler(sz, opts...)
 		}
 		consumer := func(e interface{}) {
-			if cnt < N {
-				cnt++
-				next.consumeOne(e)
+			for old := atomic.LoadInt64(cnt); old < N; old = atomic.LoadInt64(cnt) {
+				if atomic.CompareAndSwapInt64(cnt, old, old+1) {
+					next.consumeOne(e)
+					break
+				}
 			}
 		}
 		cleaner := func() {
-			cnt = 0
+			atomic.StoreInt64(cnt, N)
+			cnt = nil
 			next.cleaner()
 		}
 		canceller := func() bool {
-			return cnt == N
+			return atomic.LoadInt64(cnt) == N
 		}
-		return []Option{wrapSettler(settler), wrapConsumer(consumer), wrapCleaner(cleaner), wrapCanceller(canceller)}
+		return append(defaultWrapper(next), wrapSettler(settler),
+			wrapConsumer(consumer), wrapCleaner(cleaner), wrapCanceller(canceller))
 	}
 	return newStream(s, wrapper, "Limit")
 }
 
 func (s *stream) Skip(N int64) Stream {
 	wrapper := func(next *stream) []Option {
-		var cnt int64
-		settler := func(sz int64) {
-			cnt = 0
-			next.settler(sz)
+		var cnt *int64
+		settler := func(sz int64, opts ...Option) {
+			for _, o := range opts {
+				o(next.prev)
+			}
+			cnt = new(int64)
+			next.settler(sz, opts...)
 		}
 		consumer := func(e interface{}) {
-			if cnt < N {
-				cnt++
-			} else {
-				next.consumeOne(e)
+			for old := atomic.LoadInt64(cnt); old < N; old = atomic.LoadInt64(cnt) {
+				if atomic.CompareAndSwapInt64(cnt, old, old+1) {
+					return
+				}
 			}
+			next.consumeOne(e)
 		}
 		cleaner := func() {
-			cnt = 0
+			atomic.StoreInt64(cnt, N)
+			cnt = nil
 			next.cleaner()
 		}
 		return append(defaultWrapper(next), wrapSettler(settler), wrapConsumer(consumer), wrapCleaner(cleaner))
@@ -284,7 +340,12 @@ func (s *stream) Skip(N int64) Stream {
 func (s *stream) ToSlice() types.Slice {
 	var slice types.Slice
 	wrapper := func(next *stream) []Option {
-		settler := func(sz int64) { slice = make(types.Slice, 0, sz) }
+		settler := func(sz int64, opts ...Option) {
+			for _, o := range opts {
+				o(next.prev)
+			}
+			slice = make(types.Slice, 0, sz)
+		}
 		consumer := func(e interface{}) {
 			slice = append(slice, e)
 		}
@@ -302,7 +363,12 @@ func (s *stream) ToSliceOf(typ reflect.Type) interface{} {
 	sliceTyp := reflect.SliceOf(typ)
 	var slice reflect.Value
 	wrapper := func(next *stream) []Option {
-		settler := func(sz int64) { slice = reflect.MakeSlice(sliceTyp, 0, int(sz)) }
+		settler := func(sz int64, opts ...Option) {
+			for _, o := range opts {
+				o(next.prev)
+			}
+			slice = reflect.MakeSlice(sliceTyp, 0, int(sz))
+		}
 		consumer := func(e interface{}) {
 			slice = reflect.Append(slice, reflect.ValueOf(e))
 		}
@@ -323,7 +389,10 @@ func (s *stream) ForEach(f types.Consumer) {
 func (s *stream) AllMatch(p types.Predicate) bool {
 	var flag bool
 	wrapper := func(next *stream) []Option {
-		settler := func(sz int64) {
+		settler := func(sz int64, opts ...Option) {
+			for _, o := range opts {
+				o(next.prev)
+			}
 			flag = true
 			next.settler(sz)
 		}
@@ -344,7 +413,10 @@ func (s *stream) AllMatch(p types.Predicate) bool {
 func (s *stream) NoneMatch(p types.Predicate) bool {
 	var flag bool
 	wrapper := func(next *stream) []Option {
-		settler := func(sz int64) {
+		settler := func(sz int64, opts ...Option) {
+			for _, o := range opts {
+				o(next.prev)
+			}
 			flag = false
 			next.settler(sz)
 		}
@@ -365,7 +437,10 @@ func (s *stream) NoneMatch(p types.Predicate) bool {
 func (s *stream) AnyMatch(p types.Predicate) bool {
 	var flag bool
 	wrapper := func(next *stream) []Option {
-		settler := func(sz int64) {
+		settler := func(sz int64, opts ...Option) {
+			for _, o := range opts {
+				o(next.prev)
+			}
 			flag = false
 			next.settler(sz)
 		}
@@ -428,7 +503,7 @@ func (s *stream) ReduceWith(initValue types.R, accumulator func(types.R, types.T
 	return result
 }
 
-func (s *stream) FindFirst(p types.Predicate) optional.Optional {
+func (s *stream) FindFirst() optional.Optional {
 	none := true
 	var result interface{}
 	wrapper := func(next *stream) []Option {
